@@ -1,4 +1,6 @@
 mod app;
+mod browser_auth;
+mod diagnostics;
 mod download_media;
 mod downloads;
 mod gtk_thread;
@@ -9,18 +11,27 @@ mod methods;
 mod server;
 mod sink;
 mod tray;
-
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Panics and warn+ tracing land in the diagnostics ring + rolling file before anything
+    // else can fail, so even a daemon that dies on launch leaves evidence for the next session.
+    diagnostics::install_panic_hook();
+    let logs_dir = app::paths().data_dir.join("logs");
+    let _diagnostics = diagnostics::Diagnostics::install(&logs_dir);
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(diagnostics::CaptureLayer)
         .init();
 
     let path = ryotunes_protocol::socket_path();
@@ -52,13 +63,33 @@ fn main() -> anyhow::Result<()> {
 
         // Restore a cached Spotify session in the background so browsing and playback are ready
         // without blocking startup. Logged, never fatal: no cached credentials is the common case.
+        // The result is also announced as a `spotify-auth` event: a client that subscribed before
+        // the restore finished (the server binds while this is still connecting — the premium
+        // check alone can take 5s) otherwise never learns the session came back, and shows its
+        // sign-in gate on every launch even though the credentials are live.
         {
             let state = state.clone();
             tokio::spawn(async move {
                 match state.spotify.restore().await {
-                    Ok(true) => tracing::info!("spotify: restored a cached session"),
+                    Ok(true) => {
+                        tracing::info!("spotify: restored a cached session");
+                        state.emit("spotify-auth", serde_json::json!({ "state": "restored" }));
+                    }
                     Ok(false) => tracing::debug!("spotify: no cached session to restore"),
-                    Err(e) => tracing::warn!("spotify: restore failed: {:#}", e),
+                    Err(e) => {
+                        tracing::warn!("spotify: restore failed: {:#}", e);
+                        // Credentials exist on disk but the session is dead — tell the UI so the
+                        // gate can explain rather than silently demanding a fresh sign-in.
+                        if state.spotify.stored() {
+                            state.emit(
+                                "spotify-auth",
+                                serde_json::json!({
+                                    "state": "restore_failed",
+                                    "message": format!("Spotify sign-in no longer works: {e:#}"),
+                                }),
+                            );
+                        }
+                    }
                 }
             });
         }

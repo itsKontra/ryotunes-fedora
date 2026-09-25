@@ -61,6 +61,12 @@ pub struct PlaybackPing {
 pub enum ResolveError {
     #[error("no client could resolve a playable stream for {0}")]
     AllClientsFailed(String),
+    /// Like [`Self::AllClientsFailed`], but at least one client answered with YouTube's
+    /// "confirm you're not a bot" gate — the session has no (fresh) `visitorData`. Not terminal:
+    /// `AppState::resolve` re-bootstraps the visitorData and retries once. Never surfaces to a
+    /// user: the caller maps a second failure back to `AllClientsFailed`.
+    #[error("YouTube's bot gate rejected every playback client for {0}")]
+    BotGated(String),
     #[error("this upload could not be played. Try signing in to YouTube Music again ({0})")]
     UploadUnavailable(String),
     /// A provider stream needs the user signed in first. The message is user-facing (the daemon
@@ -125,6 +131,13 @@ impl Orchestrator {
     /// layer on a playback 403). The next resolve for this id bypasses WEB_REMIX. stream selection §2.
     pub async fn mark_web_remix_failed(&self, video_id: &str) {
         self.web_remix_failed.lock().await.insert(video_id.to_owned());
+    }
+
+    /// Forget every per-video WEB_REMIX failure. The blacklist only steers around dead cached
+    /// URLs; a force-clear of the caches wipes those too, so the next resolve should retry
+    /// WEB_REMIX rather than stay locked out for the life of the process.
+    pub async fn clear_web_remix_failures(&self) {
+        self.web_remix_failed.lock().await.clear();
     }
 
     /// Claim the one self-heal allowed per `HEAL_WINDOW`; false while a recent heal is cooling.
@@ -204,6 +217,12 @@ impl Orchestrator {
         // 4. Fallback loop. idx == -1 reuses the main response; 0.. are the fallback clients.
         let mut best: Option<Candidate> = None;
         let last_idx = order.len() as isize - 1;
+        // Set when any client answers the chain with the anti-bot gate. A gated chain is not a
+        // genuinely unplayable video: it means our anonymous session identity is missing or stale,
+        // which the caller can repair (fresh visitorData) and retry.
+        let mut bot_gated = main_resp
+            .as_ref()
+            .is_some_and(|r| !r.playability_status.is_ok() && r.playability_status.is_bot_gate());
 
         for idx in -1..=last_idx {
             let (key, resp): (String, PlayerResponse) = if idx == -1 {
@@ -231,6 +250,9 @@ impl Orchestrator {
                     Ok(r) if r.playability_status.is_ok() => (key.to_owned(), r),
                     Ok(r) => {
                         tracing::debug!(client = key, status = %r.playability_status.status, "not OK");
+                        if !bot_gated && r.playability_status.is_bot_gate() {
+                            bot_gated = true;
+                        }
                         continue;
                     }
                     Err(e) => {
@@ -372,7 +394,15 @@ impl Orchestrator {
             }),
             Err(e) => {
                 tracing::error!(video_id, error = %e, "rustypipe fallback failed");
-                Err(ResolveError::AllClientsFailed(video_id.to_owned()))
+                // Surface WHY the chain died when the reason is repairable: every InnerTube
+                // client answered the anti-bot gate and rustypipe found nothing either — our
+                // anonymous session identity (visitorData) is missing or stale, and the caller
+                // can bootstrap a fresh one and retry.
+                if bot_gated {
+                    Err(ResolveError::BotGated(video_id.to_owned()))
+                } else {
+                    Err(ResolveError::AllClientsFailed(video_id.to_owned()))
+                }
             }
         }
     }

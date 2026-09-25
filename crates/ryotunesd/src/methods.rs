@@ -72,6 +72,68 @@ impl Drop for SignInGuard {
     }
 }
 
+/// Guards the SoundCloud browser-import flow so two watchers never run at once.
+static SC_SIGNING_IN: AtomicBool = AtomicBool::new(false);
+/// How often the browser-import watcher re-reads the browser cookie stores, and how long the
+/// user gets to finish signing in there before the flow gives up.
+const SC_SIGN_IN_POLL_SECS: u64 = 2;
+const SC_SIGN_IN_TIMEOUT_SECS: u64 = 5 * 60;
+
+/// Resets [`SC_SIGNING_IN`] whenever the capture flow ends — success, failure or panic.
+struct SoundcloudSignInGuard;
+impl Drop for SoundcloudSignInGuard {
+    fn drop(&mut self) {
+        SC_SIGNING_IN.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Finish a SoundCloud sign-in from an imported session: prove the bearer against /me before
+/// persisting it, and carry the account name back for the status line.
+async fn complete_soundcloud_sign_in(
+    st: &Arc<AppState>,
+    mut auth: ryotunes_soundcloud::SoundcloudAuth,
+) {
+    st.soundcloud.set_auth(Some(auth.clone()));
+    match st.soundcloud.me().await {
+        Ok(user) => {
+            auth.username = Some(user.username.clone());
+            persist_soundcloud_auth(st, Some(&auth));
+            st.soundcloud.set_auth(Some(auth));
+            st.emit("soundcloud-auth", json!({ "state": "signed_in", "name": user.username }));
+        }
+        Err(e) => {
+            st.soundcloud.set_auth(None);
+            st.emit(
+                "soundcloud-auth",
+                json!({
+                    "state": "error",
+                    "message": format!("SoundCloud sign-in failed: {e}"),
+                }),
+            );
+        }
+    }
+}
+
+/// Persist (or forget) the SoundCloud OAuth blob under the daemon-only settings key. The
+/// crate's rotate hook writes the same key on every refresh; this writes it at sign-in and
+/// sign-out, the two moments the lifetime changes.
+fn persist_soundcloud_auth(st: &Arc<AppState>, auth: Option<&ryotunes_soundcloud::SoundcloudAuth>) {
+    match auth.map(|a| serde_json::to_string(a)) {
+        Some(Ok(json)) => st.db.set_setting(ryotunes_core::state::SOUNDCLOUD_AUTH_KEY, &json),
+        Some(Err(e)) => tracing::error!(error = %e, "soundcloud: cannot serialize auth"),
+        None => st.db.delete_setting(ryotunes_core::state::SOUNDCLOUD_AUTH_KEY),
+    }
+}
+
+/// The `{signedIn, name}` block for `soundcloud_status` and the subscribe snapshot. A stored
+/// token that never verified reads as signed out (the blob only persists after a /me proof).
+fn soundcloud_status_json(st: &Arc<AppState>) -> Value {
+    match st.soundcloud.auth() {
+        Some(auth) => json!({ "signedIn": true, "name": auth.username }),
+        None => json!({ "signedIn": false, "name": null }),
+    }
+}
+
 /// A Spotify crate error as the daemon's error body.
 fn spotify_err(e: impl ToString) -> ErrorBody {
     ErrorBody { code: "spotify".into(), message: e.to_string() }
@@ -120,6 +182,7 @@ impl Dispatch for Methods {
                     "audioFx": st.audio_fx(),
                     "provider": provider,
                     "spotify": spotify,
+                    "soundcloud": soundcloud_status_json(st),
                     "downloads": self.downloads.snapshot(),
                 }))
             }
@@ -309,8 +372,9 @@ impl Dispatch for Methods {
                 ok(v)
             }
             "clear_caches" => {
-                st.clear_caches();
-                null()
+                let rotate = arg::<Option<bool>>(&params, "rotate")?.unwrap_or(true);
+                let refreshed = st.clear_caches(rotate).await;
+                ok(json!({ "visitorDataRefreshed": refreshed }))
             }
 
             // --- auth ------------------------------------------------------------------------
@@ -337,6 +401,7 @@ impl Dispatch for Methods {
             }
             "get_provider" => ok(json!({ "provider": st.spotify.selected().as_str() })),
             "spotify_status" => ok(spotify_status_json(st).await),
+            "soundcloud_status" => ok(soundcloud_status_json(st)),
             "spotify_sign_in" => {
                 if SPOTIFY_SIGNING_IN
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -390,23 +455,20 @@ impl Dispatch for Methods {
 
             // --- browse / library ------------------------------------------------------------
             "get_home" => {
-                if st.spotify.browsing_soundcloud() {
-                    soundcloud_home(st).await
-                } else if st.spotify.browsing_spotify().await {
-                    spotify_home(st).await
-                } else {
-                    ok(st
-                        .home(arg::<Option<String>>(&params, "params")?.as_deref())
-                        .await
-                        .map_err(err)?)
+                // The merged home: YouTube Music is the spine (the default source, signed in
+                // or not), and every signed-in provider contributes its own shelves to the
+                // same page. A YouTube chip filter narrows the YouTube feed alone — the other
+                // providers have no equivalent filter — so a filtered page is YouTube-only.
+                let params = arg::<Option<String>>(&params, "params")?;
+                match params.as_deref() {
+                    Some(p) => ok(st.home(Some(p)).await.map_err(err)?),
+                    None => home_merged(st).await,
                 }
             }
             "get_home_more" => {
-                if st.spotify.browsing_soundcloud() || st.spotify.browsing_spotify().await {
-                    ok(json!({ "sections": [], "continuation": null }))
-                } else {
-                    ok(st.home_more(&arg::<String>(&params, "token")?).await.map_err(err)?)
-                }
+                // The merged page's continuation is always the YouTube spine's: the provider
+                // shelves that ride with it are finite rows, not paged feeds.
+                ok(st.home_more(&arg::<String>(&params, "token")?).await.map_err(err)?)
             }
             "get_library" => {
                 if st.spotify.browsing_soundcloud() {
@@ -832,12 +894,84 @@ impl Dispatch for Methods {
                 let thumbnail = arg::<Option<String>>(&params, "thumbnail")?.unwrap_or_default();
                 ok(self.downloads.enqueue(video_id, title, artists, thumbnail).map_err(err)?)
             }
+            "enqueue_collection" => {
+                let entries = arg::<Vec<crate::downloads::CollectionEntry>>(&params, "entries")?;
+                ok(self.downloads.enqueue_collection(entries).map_err(err)?)
+            }
             "cancel_download" => {
                 self.downloads.cancel(&arg::<String>(&params, "id")?).map_err(err)?;
                 null()
             }
             "retry_download" => {
                 ok(self.downloads.retry(&arg::<String>(&params, "id")?).map_err(err)?)
+            }
+            "soundcloud_sign_in" => {
+                // One flow at a time; a second click is a no-op while the window is open.
+                if SC_SIGNING_IN
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return ok(json!({ "started": false }));
+                }
+                let task = st.clone();
+                tokio::spawn(async move {
+                    let _guard = SoundcloudSignInGuard;
+                    // Already signed in in the browser? Import it right now — no round trip.
+                    if let Some(auth) = tokio::task::spawn_blocking(crate::browser_auth::import_any)
+                        .await
+                        .ok()
+                        .flatten()
+                    {
+                        complete_soundcloud_sign_in(&task, auth).await;
+                        return;
+                    }
+                    // Otherwise hand the real sign-in to the system default browser, where
+                    // hCaptcha and the Google/Facebook/Apple popups actually work, and watch the
+                    // browser's cookie store for the session to appear.
+                    if !crate::browser_auth::open_in_default_browser() {
+                        task.emit(
+                            "soundcloud-auth",
+                            json!({
+                                "state": "error",
+                                "message": "Could not open your browser. Sign in at soundcloud.com, then press the button again.",
+                            }),
+                        );
+                        return;
+                    }
+                    task.emit("soundcloud-auth", json!({ "state": "waiting" }));
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(SC_SIGN_IN_TIMEOUT_SECS);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(SC_SIGN_IN_POLL_SECS))
+                            .await;
+                        if tokio::time::Instant::now() >= deadline {
+                            task.emit(
+                                "soundcloud-auth",
+                                json!({
+                                    "state": "expired",
+                                    "message": "No SoundCloud sign-in was completed in the browser.",
+                                }),
+                            );
+                            return;
+                        }
+                        if let Some(auth) =
+                            tokio::task::spawn_blocking(crate::browser_auth::import_any)
+                                .await
+                                .ok()
+                                .flatten()
+                        {
+                            complete_soundcloud_sign_in(&task, auth).await;
+                            return;
+                        }
+                    }
+                });
+                ok(json!({ "started": true }))
+            }
+            "soundcloud_sign_out" => {
+                st.soundcloud.set_auth(None);
+                st.db.delete_setting(ryotunes_core::state::SOUNDCLOUD_AUTH_KEY);
+                st.emit("soundcloud-auth", json!({ "state": "signed_out" }));
+                ok(json!({ "signedIn": false }))
             }
             "clear_download_history" => {
                 self.downloads.clear_history().map_err(err)?;
@@ -849,6 +983,33 @@ impl Dispatch for Methods {
             }
             "open_download_folder" => {
                 self.downloads.open_folder().map_err(err)?;
+                null()
+            }
+
+            // --- diagnostics ---------------------------------------------------------------
+            "get_logs" => {
+                let level =
+                    arg::<Option<String>>(&params, "level")?.unwrap_or_else(|| "warn".into());
+                let source =
+                    arg::<Option<String>>(&params, "source")?.unwrap_or_else(|| "all".into());
+                let query = arg::<Option<String>>(&params, "query")?.unwrap_or_default();
+                let limit = arg::<Option<usize>>(&params, "limit")?.unwrap_or(500).clamp(1, 2000);
+                Ok(crate::diagnostics::snapshot(&level, &source, &query, limit))
+            }
+            "log_client_error" => {
+                // The client's own failures (including ones it buffered while the daemon was
+                // down) join the same record, tagged `client` so the UI can filter them apart.
+                let message = arg::<String>(&params, "message")?;
+                let target =
+                    arg::<Option<String>>(&params, "target")?.unwrap_or_else(|| "client".into());
+                let level =
+                    arg::<Option<String>>(&params, "level")?.unwrap_or_else(|| "error".into());
+                let level = if level == "warn" { "warn" } else { "error" };
+                crate::diagnostics::record(level, "client", &target, &message);
+                null()
+            }
+            "open_logs_folder" => {
+                crate::diagnostics::open_logs_folder().map_err(err)?;
                 null()
             }
 
@@ -887,12 +1048,6 @@ async fn spotify_status_json(st: &Arc<AppState>) -> Value {
 async fn spotify_name(st: &Arc<AppState>) -> Option<String> {
     let client = st.spotify.client().await?;
     client.profile().await.ok().map(|profile| profile.display_name)
-}
-
-async fn spotify_home(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
-    let client = st.spotify.client().await.ok_or_else(spotify_signed_out)?;
-    let feed = client.home().await.map_err(spotify_err)?;
-    ok(spotify_bridge::home_page(&feed))
 }
 
 async fn spotify_search_all(st: &Arc<AppState>, query: &str) -> Result<Value, ErrorBody> {
@@ -998,12 +1153,98 @@ async fn spotify_edit_playlist(
 
 // --- SoundCloud command bodies ----------------------------------------------------------------
 
-/// SoundCloud home: the "discover" selections, one shelf per selection in the order SoundCloud
-/// returns them ("Trending by genre", "Curated by SoundCloud", "Artists to watch out for"). No
-/// account needed; a fetch failure surfaces as an error toast rather than a blank page.
-async fn soundcloud_home(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
-    let selections = st.soundcloud.discover().await.map_err(soundcloud_err)?;
-    ok(soundcloud_bridge::discover_home(&selections))
+/// The merged Home: YouTube Music's own feed (works signed out — the default), with the
+/// signed-in providers' shelves woven in. Spotify contributes its made-for-you rows whenever
+/// a Premium session exists; a signed-in SoundCloud contributes its personal rows (playlists,
+/// likes, following) ahead of its discover rows. Every shelf is the same HomePage `Section`
+/// shape, and every card id (`spotify:…`, `sc:…`) already round-trips through the by-prefix
+/// dispatch in get_playlist/get_album/get_artist, so the client renders and navigates the
+/// mix without knowing where each row came from. One provider failing never blanks the
+/// page: its shelves are simply absent, and so is a dead YouTube spine — offline, the merged
+/// home still shows what the signed-in providers hold.
+async fn home_merged(st: &Arc<AppState>) -> Result<Value, ErrorBody> {
+    let mut spine = st.home(None).await.unwrap_or(innertube::HomePage {
+        chips: Vec::new(),
+        sections: Vec::new(),
+        continuation: None,
+    });
+    let mut extra: Vec<innertube::Section> = Vec::new();
+
+    // SoundCloud: personal shelves first when signed in, then the discover rows everyone gets.
+    if let Some(mut sc) = soundcloud_home_sections(st).await {
+        extra.append(&mut sc);
+    }
+
+    // Spotify: whenever a Premium session exists — the merged home aggregates every
+    // signed-in provider, regardless of which catalogue the selector points at for
+    // Library/Search. A session that died since startup recovers once from the cache.
+    if let Some(client) = st.spotify.client_or_recover().await {
+        if let Ok(feed) = client.home().await {
+            extra.extend(spotify_bridge::home_page(&feed).sections);
+        }
+    }
+
+    if !extra.is_empty() {
+        // Provider rows lead when YouTube itself has nothing to show (a signed-out first run
+        // with a dead spine); otherwise they follow the spine's opening rows so the default
+        // experience is unchanged.
+        let at = spine.sections.len().min(3);
+        spine.sections.splice(at..at, extra);
+    }
+    ok(spine)
+}
+
+/// SoundCloud's contribution to the merged home: the signed-in account's own rows first
+/// (playlists / likes / following), then the public discover shelves. A dead token clears
+/// itself so the personal rows stop demanding re-auth on every open.
+async fn soundcloud_home_sections(st: &Arc<AppState>) -> Option<Vec<innertube::Section>> {
+    let mut sections = Vec::new();
+    if st.soundcloud.signed_in() {
+        match (
+            st.soundcloud.my_playlists().await,
+            st.soundcloud.my_likes().await,
+            st.soundcloud.my_followings().await,
+        ) {
+            (Ok(playlists), Ok(likes), Ok(followings)) => {
+                sections = soundcloud_bridge::personal_home(&playlists, &likes, &followings);
+            }
+            // A 401/403 from the personal calls means the session is gone, not thin: forget
+            // it and say so, exactly like the Spotify restore_failed announcement. Any other
+            // error (a network blip) keeps the token — clearing it would turn one failed
+            // page load into a sign-out.
+            (a, b, c) => {
+                let is_dead = |e: &ryotunes_soundcloud::Error| {
+                    matches!(e, ryotunes_soundcloud::Error::Api { status: 401 | 403, .. })
+                };
+                // The three calls differ in payload type, so test their errors one by one.
+                let dead = a.as_ref().err().is_some_and(is_dead)
+                    || b.as_ref().err().is_some_and(is_dead)
+                    || c.as_ref().err().is_some_and(is_dead);
+                if dead {
+                    st.soundcloud.set_auth(None);
+                    st.db.delete_setting(ryotunes_core::state::SOUNDCLOUD_AUTH_KEY);
+                    st.emit(
+                        "soundcloud-auth",
+                        json!({
+                            "state": "restore_failed",
+                            "message": "Your SoundCloud session expired. Sign in again to \
+                                        see your playlists and likes.",
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    match st.soundcloud.discover().await {
+        Ok(selections) => {
+            sections.extend(soundcloud_bridge::discover_home(&selections).sections);
+            Some(sections)
+        }
+        // Discover is public; failing it is a network problem, and the personal rows (if any)
+        // still ride.
+        Err(_) if !sections.is_empty() => Some(sections),
+        Err(_) => None,
+    }
 }
 
 async fn soundcloud_search_all(st: &Arc<AppState>, query: &str) -> Result<Value, ErrorBody> {

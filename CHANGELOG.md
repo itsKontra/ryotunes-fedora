@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## v1.1.6 - 2026-09-25
+
+- SoundCloud sign-in now happens in your own browser instead of a Ryotunes window: pressing Connect opens soundcloud.com (captchas and Google/Facebook/Apple popups work there), and the daemon watches your browser's cookie stores — Firefox-family and Chromium-family profiles, default browser first — importing the session the moment it appears and proving the token against `/me` before saving it. Already signed in in the browser? One click imports it instantly, no browser round trip. Cookie stores are only re-read when their file actually changes, and an unfinished sign-in ends with a clear message after five minutes rather than hanging.
+
+- Installing an update from Settings now restarts Ryotunes by itself: after the package lands, a detached helper waits for the old daemon to release its socket lock, then relaunches — socket-activating the new daemon and opening the new client — instead of leaving "quit and reopen" as the user's chore. If the helper fails, the app stays open with the old manual guidance as the fallback.
+
+## v1.1.5 - 2026-09-25
+
+## v1.1.4 - 2026-09-24
+
+- Fixed "Download playlist / Download album" always failing (albums: "missing field `video_id`", playlists: "missing field `videoId`"): two stacked bugs — the client mapped an album/playlist's rows into batch entries twice, dropping every track id, and the daemon's batch endpoint read its JSON in snake_case while the client posts camelCase. Single-track downloads were unaffected, which is why only albums and playlists broke.
+- Album and playlist downloads now read as one collection: the queue and history group every batch under a single card showing the album/playlist cover, kind, aggregate progress and how many tracks are saved, waiting, failed or cancelled — expandable to its per-track rows. Batch tracks also land in a folder named after their collection on disk, and re-downloading still dedups against them wherever they sit.
+- Added Settings ▸ Diagnostics: one rolling record of everything that went wrong, for both halves of the app. The daemon logs its own warnings and errors, every failed request, and panics to a ring buffer and a rotating file (`$XDG_DATA_HOME/dev.ryoku.ryotunes/logs/ryotunesd.log`); the client forwards the failures it sees (rejected actions, lost connections, error toasts), buffering them while the daemon is down and delivering them on reconnect. The page filters by level, source and text, copies the whole list to the clipboard, and opens the log folder — so "songs won't play" finally has evidence to show instead of a guess.
+- Settings ▸ Storage's cache action is now a one-click playback repair: "Force clear caches" drops every layer that can wedge stream resolution — cached stream URLs and lyrics, mpv's on-disk audio bytes, the stored PoToken, the per-video WEB_REMIX failure blacklist — and rotates the anonymous YouTube playback identity (`visitorData`) on the spot, which is the manual fix for "Couldn't load this track — YouTube rejected the stream link". If the identity re-fetch fails (offline), the toast says so; the token is still dropped, so the next launch or a bot-gated resolve re-bootstraps it. Changing stream quality keeps clearing only the URL cache and no longer rotates the identity.
+
+## v1.1.1 - 2026-09-24
+
+- Added SoundCloud sign-in: a Ryotunes window opens the site's own sign-in (account or Google/Facebook/Apple), captures the session's OAuth token from the webview's cookie jar, proves it against `/me` before saving it, and keeps it alive through SoundCloud's rotating refresh. Signing in is optional — SoundCloud still browses and plays as a guest — but a signed-in account adds its own playlists, liked tracks and followed artists to Home, and the token survives restarts (an expired one says so instead of silently vanishing).
+- Home is now the merged feed: YouTube Music's shelves remain the spine (the default source, signed in or not), and every signed-in provider contributes its own shelves to the same page — Spotify's made-for-you rows when a Premium session exists, SoundCloud's personal rows when connected. Cards navigate and play across providers exactly as before; one provider being down never blanks the page.
+
+## v1.1.0 - 2026-09-24
+
+- Fixed some users being unable to play any YouTube track ("Skipped (unavailable)" on everything): YouTube's anonymous playback clients now require a valid `visitorData`, and a failed first fetch used to leave the daemon without one for its whole life, so every stream request hit Google's bot gate. The startup bootstrap retries with backoff, and a resolve that is rejected by the bot gate now fetches a fresh `visitorData` on the spot and retries once.
+- Fixed Spotify Premium users seeing "sign in" on every launch and every track skipped as "not available": the cached session is announced to clients once it restores (it used to finish silently after the UI snapshot, leaving the gate up), the sign-in gate explains a genuinely dead session instead of demanding a fresh login, a dead librespot session is detected and (once per credential lifetime) recovered from saved credentials before a track is reported as needing sign-in, a Spotify queue that needs sign-in now stops with the real reason instead of toast-storming "Skipped (unavailable)", and the Spotify device identity is persisted per installation instead of re-randomising on every launch.
+- Added Download playlist to the playlist page menu: albums and playlists batch-download through one daemon call that gathers every continuation page and admits the whole collection against a single dedup pass.
+- Downloaded tracks are now smart-deduplicated: re-downloading a collection (or a single track) skips audio already in the download folder even when it lives there under a different upload's id or a ` (N)` collision name, matching on the normalized "artist title" as well as the exact filename.
+
 ## v1.0.8 - 2026-09-20
 
 - Stopped Now Playing stuttering while the window is resized or scaled: the cover size read the column's assigned width and the body's assigned height, feeding layout outputs back into the children's preferred sizes, so the column re-polished itself on every pass. The cover now sizes from the root and the header's implicit height, which are layout inputs.

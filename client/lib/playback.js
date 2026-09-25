@@ -108,6 +108,22 @@ function applyEvent(s, name, data) {
                 flow: "", error: "" };
             return { toast: "Signed in to Spotify" + ((data && data.name) ? (" as " + data.name) : ""), kind: "success" };
         }
+        if (st === "restored") {
+            // The startup restore finished after this client's opening snapshot was taken --
+            // the fix for the sign-in gate that reappeared on every launch. Restore is gated
+            // on Premium, so premium is known true; the display name arrives with a snapshot.
+            s.spotify = { signedIn: true, stored: true,
+                name: (s.spotify && s.spotify.name) ? s.spotify.name : null,
+                premium: true, flow: "", error: "" };
+            return null;
+        }
+        if (st === "restore_failed") {
+            // Credentials are on disk but the cached session is dead: keep the reason on the
+            // gate instead of silently demanding a fresh sign-in.
+            var why = (data && data.message) ? data.message : "Spotify sign-in no longer works";
+            s.spotify = Object.assign({}, s.spotify, { signedIn: false, stored: true, error: why });
+            return null;
+        }
         if (st === "signed_out") {
             s.spotify = { signedIn: false, stored: false, name: null, premium: null };
             return null;
@@ -117,6 +133,36 @@ function applyEvent(s, name, data) {
             // Keep the reason on the gate: a toast alone reads as "nothing happened".
             s.spotify = Object.assign({}, s.spotify, { flow: "", error: msg });
             return { toast: msg, kind: "error" };
+        }
+        return null;
+    }
+    case "soundcloud-auth": {
+        // The SoundCloud sign-in flow's progress. Sign-in happens in the user's own browser
+        // (captchas and IdP popups work there); the daemon opens it and watches the browser's
+        // cookie store, so the states are: waiting (browser opened, polling), signed_in,
+        // signed_out, expired (nobody finished in the browser), restore_failed (a persisted
+        // token died) and error.
+        var sc = (data && data.state) ? data.state : "";
+        if (sc === "signed_in") {
+            s.soundcloud = { signedIn: true, name: (data && data.name) ? data.name : null, error: "" };
+            return { toast: "Signed in to SoundCloud" + ((data && data.name) ? (" as " + data.name) : ""), kind: "success" };
+        }
+        if (sc === "signed_out") {
+            s.soundcloud = { signedIn: false, name: null, error: "" };
+            return null;
+        }
+        if (sc === "waiting") {
+            s.soundcloud = { signedIn: false, name: null, error: "Finish signing in at soundcloud.com in your browser \u2014 Ryotunes picks the session up automatically." };
+            return { toast: "Opened soundcloud.com in your browser \u2014 sign in there and Ryotunes will connect", kind: "info" };
+        }
+        if (sc === "expired") {
+            s.soundcloud = { signedIn: false, name: null, error: "" };
+            return { toast: "No SoundCloud sign-in was completed in the browser", kind: "info" };
+        }
+        if (sc === "restore_failed" || sc === "error") {
+            var why = (data && data.message) ? data.message : "SoundCloud sign-in failed";
+            s.soundcloud = { signedIn: false, name: null, error: why };
+            return { toast: why, kind: "error" };
         }
         return null;
     }

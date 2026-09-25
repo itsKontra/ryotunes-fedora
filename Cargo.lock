@@ -403,6 +403,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "block2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -546,6 +555,15 @@ checksum = "374b7c592d9c00c1f4972ea58390ac6b18cbb6ab79011f3bdc90a0b82ca06b77"
 dependencies = [
  "serde",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -2433,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "innertube"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "hex",
  "reqwest 0.12.28",
@@ -2453,6 +2471,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
+ "block-padding",
  "generic-array",
 ]
 
@@ -2938,7 +2957,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "listen-protocol"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3831,7 +3850,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "player"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "libc",
  "libmpv2",
@@ -4689,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "ryotunes"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4719,7 +4738,7 @@ dependencies = [
 
 [[package]]
 name = "ryotunes-cli"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "ryotunes-protocol",
  "serde",
@@ -4728,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "ryotunes-core"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4764,7 +4783,7 @@ dependencies = [
 
 [[package]]
 name = "ryotunes-protocol"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -4772,8 +4791,10 @@ dependencies = [
 
 [[package]]
 name = "ryotunes-soundcloud"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
+ "base64 0.22.1",
+ "parking_lot",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -4785,7 +4806,7 @@ dependencies = [
 
 [[package]]
 name = "ryotunes-spotify"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4803,15 +4824,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "uuid 1.25.0",
  "vergen",
 ]
 
 [[package]]
 name = "ryotunesd"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
+ "aes",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "cbc",
  "glib",
  "gtk",
  "innertube",
@@ -4820,12 +4845,17 @@ dependencies = [
  "libc",
  "lofty",
  "parking_lot",
+ "pbkdf2",
  "player",
+ "rusqlite",
  "ryotunes-core",
  "ryotunes-protocol",
  "ryotunes-soundcloud",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5558,7 +5588,7 @@ dependencies = [
 
 [[package]]
 name = "sync-server"
-version = "1.0.8"
+version = "1.1.6"
 dependencies = [
  "futures-util",
  "listen-protocol",

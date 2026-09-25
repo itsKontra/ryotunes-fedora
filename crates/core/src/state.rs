@@ -48,6 +48,11 @@ pub const LOCAL_PLAYLIST_PREFIX: &str = "RYOTUNES_LOCAL_PLAYLIST:";
 pub const LIKED_SONGS_ID: &str = "RYOTUNES_LOCAL_PLAYLIST:liked";
 pub const LIKED_SONGS_TITLE: &str = "Liked Songs";
 
+/// The persisted SoundCloud OAuth blob (access + rotating refresh token + session cookie).
+/// Deliberately NOT in [`UI_SETTINGS`]: like `session_cookie`, it is auth material the
+/// renderer must never see; only the daemon's sign-in/rotate paths write it.
+pub const SOUNDCLOUD_AUTH_KEY: &str = "soundcloud_auth";
+
 /// Settings the UI is allowed to read *and write*. Session/auth material (`session_cookie`,
 /// `selected_identity_json`, `data_sync_id`, `account_json`, `account_selection_pending`,
 /// `visitor_data`) and internal blobs (`queue_json`, `queue_index`, `queue_position`) never cross
@@ -165,6 +170,9 @@ pub struct AppState {
     /// now-playing snapshot can render the meta line without another round-trip. Bounded in
     /// `remember_sc_meta`.
     sc_meta: parking_lot::Mutex<std::collections::HashMap<String, ScTrackMeta>>,
+    /// Unix secs of the last on-demand visitorData (re)bootstrap attempt, so a failing session
+    /// retries on a cooldown instead of hammering sw.js_data on every skipped track.
+    last_visitor_try: AtomicU64,
 }
 
 /// One live Spotify stream held on [`AppState`]: the cheap transport handle the daemon seeks
@@ -428,6 +436,25 @@ impl AppState {
             Arc::new(crate::spotify::SpotifyState::new(paths.data_dir.join("spotify"), selected));
         let soundcloud =
             Arc::new(ryotunes_soundcloud::SoundCloud::new(paths.data_dir.join("soundcloud")));
+        // A captured SoundCloud sign-in survives restarts like the YouTube cookie does: the
+        // JSON blob lives under a settings key outside UI_SETTINGS, so the renderer can
+        // neither read nor overwrite it. Every token rotation writes the new pair back
+        // through this hook (SoundCloud's refresh token is single-use — losing a rotation
+        // dead-ends the session), and the restore is validated against /me by the host.
+        if let Some(raw) = db.get_setting(SOUNDCLOUD_AUTH_KEY) {
+            if let Ok(auth) = serde_json::from_str::<ryotunes_soundcloud::SoundcloudAuth>(&raw) {
+                soundcloud.set_auth(Some(auth));
+            }
+        }
+        let rotate_db = Arc::clone(&db);
+        soundcloud.set_on_rotate(std::sync::Arc::new(move |auth| {
+            match serde_json::to_string(&auth) {
+                Ok(json) => rotate_db.set_setting(SOUNDCLOUD_AUTH_KEY, &json),
+                Err(e) => {
+                    tracing::error!(error = %e, "soundcloud: cannot serialize rotated auth")
+                }
+            }
+        }));
         AppState {
             it,
             clients,
@@ -444,6 +471,7 @@ impl AppState {
             spotify,
             soundcloud,
             sc_meta: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            last_visitor_try: AtomicU64::new(0),
             queue: Mutex::new(QueueState::default()),
             is_playing: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -894,7 +922,10 @@ impl AppState {
         // them. Opening the stream starts librespot decoding into the FIFO immediately; mpv is
         // pointed at that FIFO with the rawaudio demuxer options.
         if let Some(tid) = crate::spotify::spotify_track_id(video_id) {
-            let Some(client) = self.spotify.client().await else {
+            // `client_or_recover` gives a session that died since startup (or a restore that lost
+            // the race with the first client connecting) exactly one chance to come back from the
+            // saved credentials before this track is honestly reported as needing sign-in.
+            let Some(client) = self.spotify.client_or_recover().await else {
                 return Err(ResolveError::SignInRequired(
                     "Sign in to Spotify to play this".to_owned(),
                 ));
@@ -1010,10 +1041,33 @@ impl AppState {
                 stream_client: "soundcloud".to_owned(),
             });
         }
-        let data = self
+        let data = match self
             .orchestrator
             .resolve(video_id, is_upload, self.quality(), &self.disabled_clients())
-            .await?;
+            .await
+        {
+            Ok(d) => d,
+            // Every InnerTube client answered "confirm you're not a bot": the session's
+            // visitorData is missing or stale (YouTube only honours the anonymous fallback
+            // clients with one). Fetch a fresh identity — once per cooldown window — and retry
+            // this resolve exactly once. Without this the one-shot startup bootstrap leaving a
+            // user unable to play ANY track until a restart was unrepairable.
+            Err(ResolveError::BotGated(vid)) => {
+                if self.refresh_visitor_data().await.is_none() {
+                    return Err(ResolveError::AllClientsFailed(vid));
+                }
+                self.orchestrator
+                    .resolve(video_id, is_upload, self.quality(), &self.disabled_clients())
+                    .await
+                    .map_err(|e| match e {
+                        // The fresh token didn't help (or the IP itself is flagged): report the
+                        // same generic failure users saw before, never the internal variant.
+                        ResolveError::BotGated(v) => ResolveError::AllClientsFailed(v),
+                        other => other,
+                    })?
+            }
+            Err(e) => return Err(e),
+        };
         // Never cache rustypipe URLs: googlevideo serves them only for bounded-Range requests,
         // which mpv doesn't send → LOADING_FAILED(-13). Caching one poisons the videoId for ~6h.
         if data.stream_client != "rustypipe" && !is_upload {
@@ -1032,6 +1086,36 @@ impl AppState {
             );
         }
         Ok(data)
+    }
+
+    /// The on-demand visitorData (re)bootstrap a bot-gated resolve triggers: fetch a fresh
+    /// anonymous identity from sw.js_data, install it in the shared session, and persist it so
+    /// the next launch starts with one. Returns `Some(vd)` when a *new* token is in place,
+    /// `None` when the fetch failed or the cooldown suppressed the attempt — callers then treat
+    /// the gate as a plain failure rather than hammering Google.
+    ///
+    /// Cooldown lives here rather than in the orchestrator's retry because a whole broken queue
+    /// skips track-per-track: every skip would otherwise pay one sw.js_data round trip.
+    pub async fn refresh_visitor_data(self: &std::sync::Arc<Self>) -> Option<String> {
+        const RETRY_COOLDOWN_SECS: u64 = 5 * 60;
+        let now = now_secs().max(0) as u64;
+        let last = self.last_visitor_try.swap(now, Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < RETRY_COOLDOWN_SECS {
+            tracing::debug!("visitorData refresh on cooldown; skipping");
+            return None;
+        }
+        match self.it.fetch_visitor_data().await {
+            Ok(vd) => {
+                tracing::info!("visitorData re-bootstrapped after bot gate");
+                self.it.set_visitor_data(Some(vd.clone()));
+                self.db.set_setting("visitor_data", &vd);
+                Some(vd)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "visitorData refresh failed");
+                None
+            }
+        }
     }
 
     /// Speculatively resolve one stream into the normal latency cache without touching playback.
@@ -1733,6 +1817,15 @@ impl AppState {
                     }
                 }
                 Err(e) => {
+                    // A provider stream that needs the user signed in is not "unavailable":
+                    // skipping past it row-by-row turns a whole Spotify queue into a storm of
+                    // "Skipped (unavailable)" toasts and hides the one action that fixes it.
+                    // Stop the queue on the spot and say what is actually wrong.
+                    if let ResolveError::SignInRequired(message) = &e {
+                        tracing::warn!(video_id = item.video_id, message, "playback needs sign-in");
+                        self.emit_error(&item.video_id, message);
+                        return false;
+                    }
                     let mut q = self.queue.lock().await;
                     // Deliberately ignores repeat-all: wrapping the unplayable-skip would spin
                     // forever on a queue where nothing resolves. Skips stop at the tail.
@@ -2828,9 +2921,18 @@ impl AppState {
         self.db.set_setting("queue_position", &pos.to_string());
     }
 
-    /// Clear both cache tiers (settings "Clear caches"): the SQLite URL cache + mpv's on-disk
-    /// audio bytes. File cleanup is best-effort; the current track may need to re-buffer.
-    pub fn clear_caches(&self) {
+    /// Force-clear everything playback remembers about how to get a stream: the SQLite URL +
+    /// lyrics cache, mpv's on-disk audio bytes, the stored PoToken, and the per-video WEB_REMIX
+    /// blacklist. A stale cached stream URL or a stale/missing `visitorData` both surface as mpv
+    /// 403s ("YouTube rejected the stream link") that no retry can fix on their own — this is
+    /// the manual lever for it.
+    ///
+    /// `rotate_identity` additionally drops the anonymous YouTube playback identity and
+    /// re-bootstraps a fresh one (the settings button; quality changes pass false). Returns
+    /// whether a fresh visitorData was installed — false when not rotating or when the fetch
+    /// failed (offline). A failed fetch still leaves the token deleted, so the next launch or
+    /// bot-gated resolve re-bootstraps it anyway.
+    pub async fn clear_caches(&self, rotate_identity: bool) -> bool {
         self.db.clear_stream_cache();
         // The stored PoToken is a cache too, and "clear caches" is where someone goes when
         // playback has started behaving oddly. Dropping it costs one BotGuard bootstrap.
@@ -2838,6 +2940,30 @@ impl AppState {
         if let Ok(entries) = std::fs::read_dir(&self.paths.cache_dir) {
             for e in entries.flatten() {
                 let _ = std::fs::remove_file(e.path());
+            }
+        }
+        self.orchestrator.clear_web_remix_failures().await;
+        // The blacklist is an in-memory hint derived from cached URLs; with the cache wiped,
+        // WEB_REMIX gets another chance.
+        if !rotate_identity {
+            return false;
+        }
+        // Drop the persisted anonymous identity before fetching, so a fetch failure still leaves
+        // the daemon in the "re-bootstrap" state instead of holding the stale token it just
+        // complained about. Clearing the cooldown lets the on-demand bot-gate heal fire again.
+        self.db.delete_setting("visitor_data");
+        self.it.set_visitor_data(None);
+        self.last_visitor_try.store(0, Ordering::Relaxed);
+        match self.it.fetch_visitor_data().await {
+            Ok(vd) => {
+                self.it.set_visitor_data(Some(vd.clone()));
+                self.db.set_setting("visitor_data", &vd);
+                tracing::info!("playback caches force-cleared; visitorData re-bootstrapped");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "visitorData refresh during cache clear failed");
+                false
             }
         }
     }

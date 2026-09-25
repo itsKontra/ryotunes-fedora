@@ -66,6 +66,7 @@ Item {
         { k: "account", l: "Account", jp: "鍵" },
         { k: "local", l: "Local music", jp: "音源" },
         { k: "playlists", l: "Playlists", jp: "転送" },
+        { k: "diagnostics", l: "Diagnostics", jp: "診" },
         { k: "about", l: "About", jp: "力" }
     ]
 
@@ -164,7 +165,9 @@ Item {
     }
     function setQuality(q) {
         page.setSetting("quality", q)
-            .then(() => Daemon.call("clear_caches").catch(() => {}))
+            // URLs are keyed by video only, so they must be dropped; the playback identity
+            // survives a quality change untouched.
+            .then(() => Daemon.call("clear_caches", { rotate: false }).catch(() => {}))
             .then(() => Playback.toast("Audio quality updated", "success"));
     }
     function saveProxy() {
@@ -175,7 +178,15 @@ Item {
     function clearCaches() {
         page.clearing = true;
         Daemon.call("clear_caches")
-            .then(() => { page.clearing = false; Playback.toast("Caches cleared", "success"); })
+            .then((res) => {
+                page.clearing = false;
+                // The daemon force-clears every stream cache and re-bootstraps the YouTube
+                // playback identity; the second half needs the network to work.
+                if (res && res.visitorDataRefreshed === false)
+                    Playback.toast("Caches cleared — offline, playback ID will retry on next play", "info");
+                else
+                    Playback.toast("Playback caches cleared", "success");
+            })
             .catch((e) => { page.clearing = false; Playback.toast((e && e.message) ? e.message : String(e), "error"); });
     }
 
@@ -197,13 +208,34 @@ Item {
         page.updateStatus = "installing";
         page.updateError = "";
         Daemon.call("install_update", { version: version })
-            .then((res) => { page.installedVersion = (res && res.version) ? res.version : version; page.updateStatus = "installed"; })
+            .then((res) => {
+                page.installedVersion = (res && res.version) ? res.version : version;
+                page.updateStatus = "installed";
+                page.restartIntoUpdate();
+            })
             .catch((e) => { page.updateError = (e && e.message) ? e.message : String(e); page.updateStatus = "error"; });
+    }
+    // The package is on disk, but this client and the daemon are still running the old code.
+    // Finish like a normal app does: restart itself. A detached helper waits for the old
+    // daemon to release its lock file — the daemon's exit is the full teardown (download
+    // reaping included), so waiting on the lock beats racing it with a timer — then runs the
+    // launcher, which socket-activates the new daemon and opens the new client. Meanwhile we
+    // ask the daemon to quit and close this window. If the helper somehow fails, the app
+    // stays open showing the manual "quit and reopen" guidance as the fallback.
+    function restartIntoUpdate() {
+        var lock = (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/ryotunes/ryotunesd.sock.lock";
+        Quickshell.execDetached([
+            "sh", "-c",
+            "flock -w 60 \"$1\" -c true 2>/dev/null; exec ryotunes",
+            "ryotunes-update-restart", lock
+        ]);
+        Daemon.call("quit").catch(() => {});
+        Qt.quit();
     }
     function updateMessage() {
         if (page.updateStatus === "checking") return "Checking for a new version…";
         if (page.updateStatus === "installing") return "Downloading and verifying the update, then asking for administrator approval. Keep Ryotunes open until it finishes.";
-        if (page.updateStatus === "installed") return "Ryotunes " + page.installedVersion + " is installed. Quit Ryotunes and open it again to finish — closing the window isn't enough; the background service reloads only on a full restart.";
+        if (page.updateStatus === "installed") return "Ryotunes " + page.installedVersion + " installed — restarting Ryotunes to finish. If the window is still here, quit it and open it again; the background service reloads only on a full restart.";
         if (page.updateStatus === "error") return "Update failed: " + page.updateError;
         var info = page.updateInfo;
         if (!info) return "";
@@ -514,6 +546,7 @@ Item {
                     else if (page.section === "account") h = accountCol.implicitHeight;
                     else if (page.section === "local") h = localCol.implicitHeight;
                     else if (page.section === "playlists") h = playlistsCol.implicitHeight;
+                    else if (page.section === "diagnostics") h = diagnosticsLoader.item ? diagnosticsLoader.item.implicitHeight : 0;
                     else h = aboutCol.implicitHeight;
                     return h + Style.sp(16);
                 }
@@ -1002,13 +1035,13 @@ Item {
                             Text { Layout.fillWidth: true; text: "Cache"; color: Tokens.ink; font.family: Style.fontUi; font.pixelSize: Style.fs.md; font.weight: Font.Medium; wrapMode: Text.WordWrap }
                             Text {
                                 Layout.fillWidth: true
-                                text: "Clear cached stream URLs and downloaded audio bytes."
+                                text: "Clear cached stream URLs and downloaded audio bytes, and reset the YouTube playback identity. Fixes tracks that fail with “YouTube rejected the stream link”."
                                 color: Tokens.inkMuted; font.family: Style.fontUi; font.pixelSize: Style.fs.sm; wrapMode: Text.WordWrap
                             }
                         }
                         Pill {
                             Layout.alignment: Qt.AlignVCenter
-                            label: page.clearing ? "Clearing…" : "Clear caches"
+                            label: page.clearing ? "Clearing…" : "Force clear caches"
                             icon: "close"
                             enabled: !page.clearing
                             onClicked: page.clearCaches()
@@ -1120,14 +1153,30 @@ Item {
                             Layout.fillWidth: true
                             spacing: 1
                             Text {
-                                text: "Listening as a guest"
+                                readonly property var sc: Playback.soundcloud || ({})
+                                text: (sc.signedIn && sc.name) ? sc.name : (sc.signedIn ? "Signed in" : "Listening as a guest")
                                 color: Tokens.ink; font.family: Style.fontUi; font.pixelSize: Style.fs.lg; font.weight: Font.DemiBold
                                 elide: Text.ElideRight; Layout.fillWidth: true
                             }
                             Text {
-                                text: "No account needed \u00b7 SoundCloud's public catalogue plays for everyone."
-                                color: Tokens.inkMuted; font.family: Style.fontUi; font.pixelSize: Style.fs.sm
+                                readonly property var sc: Playback.soundcloud || ({})
+                                text: sc.signedIn ? "Connected \u00b7 your playlists and likes join Home"
+                                    : (sc.error ? sc.error
+                                    : "No account needed \u00b7 SoundCloud's public catalogue plays for everyone.")
+                                color: (sc.error && !sc.signedIn) ? Style.accent : Tokens.inkMuted
+                                font.family: Style.fontUi; font.pixelSize: Style.fs.sm
                                 wrapMode: Text.WordWrap; Layout.fillWidth: true
+                            }
+                        }
+                        Pill {
+                            readonly property var sc: Playback.soundcloud || ({})
+                            label: sc.signedIn ? "Sign out" : "Sign in to SoundCloud"
+                            icon: sc.signedIn ? "close" : "soundcloud"
+                            primary: !sc.signedIn
+                            onClicked: {
+                                var out = !!(Playback.soundcloud && Playback.soundcloud.signedIn);
+                                var call = out ? Playback.soundcloudSignOut() : Playback.soundcloudSignIn();
+                                call.catch((e) => Playback.toast((e && e.message) ? e.message : String(e), "error"));
                             }
                         }
                     }
@@ -1301,6 +1350,16 @@ Item {
                         }
                     }
                 }
+
+                // ─────────────────────────── DIAGNOSTICS ───────────────────────────
+                Loader {
+                    id: diagnosticsLoader
+                    active: page.section === "diagnostics"
+                    visible: active
+                    anchors { left: parent.left; right: parent.right; top: parent.top; leftMargin: Style.sp(6); rightMargin: Style.sp(6); topMargin: Style.sp(4) }
+                    source: "DiagnosticsPage.qml"
+                }
+
 
                 // ─────────────────────────── ABOUT ───────────────────────────
                 ColumnLayout {

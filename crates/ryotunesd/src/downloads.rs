@@ -1,6 +1,6 @@
 //! Bounded, daemon-owned downloads. Slots live until child processes are reaped, settings are
 //! frozen when a job is queued, and files are atomically published without replacing existing files.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -103,6 +103,13 @@ pub struct DownloadJob {
     pub file_path: Option<String>,
     pub error: Option<String>,
     pub source: String,
+    /// The album/playlist this track was batch-added from, when it was. The client groups
+    /// collection downloads under one card per collection using this label. `#[serde(default)]`
+    /// keeps queues persisted by older builds loadable.
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub collection_kind: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
     #[serde(default = "DownloadSettings::defaults")]
@@ -159,6 +166,124 @@ fn classify(video_id: &str) -> Result<Source, String> {
 /// refused rather than handed to yt-dlp as an ambiguous URL/search.
 fn is_youtube_id(id: &str) -> bool {
     id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+// --- collection downloads + smart dedup ------------------------------------------------------
+/// One track a collection (playlist/album) offered for batch download. camelCase on the wire,
+/// mirroring the download job's field names so the client sends what it already renders.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionEntry {
+    pub video_id: String,
+    pub title: String,
+    pub artists: String,
+    pub thumbnail: String,
+    /// The album/playlist name the batch came from; stamped onto each created job so the client
+    /// can group them. Optional so a caller may batch unlabelled tracks.
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub collection_kind: Option<String>,
+}
+
+/// A snapshot of the download folder's audio files, used to refuse re-downloading a track that
+/// is already saved — possibly under a different source id (a reupload, a remaster, or a file
+/// named before Ryotunes appended the `[videoId]` tag). Stems map to their paths so a dedup hit
+/// can hand the client the file it already owns.
+struct FolderIndex {
+    /// Exact file stems (Ryotunes names always end in ` [videoId]`).
+    stems: HashMap<String, PathBuf>,
+    /// The same names, lowercased with non-alphanumerics and the id tag removed: the "smart"
+    /// half — matching two uploads of the same `Artist - Title` across id changes.
+    keys: HashMap<String, PathBuf>,
+    root: PathBuf,
+}
+
+const INDEX_MAX_FILES: usize = 20_000;
+const INDEX_MAX_DEPTH: usize = 6;
+
+impl FolderIndex {
+    fn build(root: &Path) -> FolderIndex {
+        let mut index =
+            FolderIndex { stems: HashMap::new(), keys: HashMap::new(), root: root.to_path_buf() };
+        index.walk(root, 0);
+        index
+    }
+
+    fn walk(&mut self, dir: &Path, depth: usize) {
+        if depth > INDEX_MAX_DEPTH || self.stems.len() >= INDEX_MAX_FILES {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            if self.stems.len() >= INDEX_MAX_FILES {
+                return;
+            }
+            // Skip our own staging dir, and never descend a symlink: `file_type` here does not
+            // follow links, so links surface as neither file nor dir and are simply ignored.
+            if entry.file_name().to_str().is_some_and(|n| n.starts_with(STAGING_DIR)) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else { continue };
+            if file_type.is_dir() {
+                self.walk(&entry.path(), depth + 1);
+            } else if file_type.is_file() {
+                let name = entry.file_name();
+                let Some(stem) = Path::new(&*name).file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let stem = stem.to_owned();
+                let path = entry.path();
+                self.stems.insert(stem.clone(), path.clone());
+                self.keys.entry(normalize_key(strip_id_tag(&stem))).or_insert(path);
+            }
+        }
+    }
+
+    /// The saved file for a candidate (title/artist/source id, named by the same rules `publish`
+    /// uses), if one exists: exact stem, any ` (N)` collision suffix, or the same normalized
+    /// "artist title" key under a different id. Paths are resolved against the folder root so
+    /// callers can report them directly.
+    fn find(&self, settings: &DownloadSettings, entry: &CollectionEntry) -> Option<PathBuf> {
+        let base = if settings.organize_by_artist || entry.artists.trim().is_empty() {
+            entry.title.clone()
+        } else {
+            format!("{} - {}", entry.artists.trim(), entry.title.trim())
+        };
+        let name = sanitize_component(&base);
+        let stem = format!("{name} [{}]", sanitize_component(&entry.video_id));
+        if let Some(path) = self.stems.get(&stem) {
+            return Some(self.relativize(path));
+        }
+        for suffix in 1..=50u32 {
+            if let Some(path) = self.stems.get(&format!("{stem} ({suffix})")) {
+                return Some(self.relativize(path));
+            }
+        }
+        let key = normalize_key(strip_id_tag(&stem));
+        if key.is_empty() {
+            return None;
+        }
+        self.keys.get(&key).map(|path| self.relativize(path))
+    }
+
+    fn relativize(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
+    }
+}
+
+/// The trailing `[videoId]` tag Ryotunes appends to every published name, if present.
+fn strip_id_tag(stem: &str) -> &str {
+    match stem.rfind(" [") {
+        Some(open) if stem.ends_with(']') && open + 2 < stem.len() => &stem[..open],
+        _ => stem,
+    }
+}
+
+/// Lowercase alphanumeric only: the collision course for "Artist - Title", "artist–title", and a
+/// name re-sanitized through a different character set.
+fn normalize_key(input: &str) -> String {
+    input.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 struct Running {
@@ -264,22 +389,43 @@ impl Downloads {
                 return Ok(job.clone());
             }
             ensure_capacity(&state)?;
-            let job = DownloadJob {
-                id: self.inner.next_id(),
-                video_id,
-                title,
-                artists,
-                thumbnail,
-                status: DownloadStatus::Queued,
-                progress: 0,
-                file_path: None,
-                error: None,
-                source: source.label().into(),
-                created_at: now_secs(),
-                finished_at: None,
-                settings: state.settings.clone(),
-                warnings: Vec::new(),
-            };
+            // Smart dedup beyond the job history (which is capped): a file already sitting in
+            // the download folder under this id, a collision suffix, or the same normalized
+            // title from a different upload counts as downloaded. The record returned is a
+            // description of the existing file, deliberately not part of the queue — the client
+            // renders `jobs`, so it never becomes a cancel/retry target.
+            {
+                let entry = CollectionEntry {
+                    video_id: video_id.clone(),
+                    title: title.clone(),
+                    artists: artists.clone(),
+                    thumbnail: thumbnail.clone(),
+                    collection: None,
+                    collection_kind: None,
+                };
+                let index = FolderIndex::build(Path::new(&state.settings.path));
+                if let Some(path) = index.find(&state.settings, &entry) {
+                    let mut job = new_job(&self.inner, &state.settings, source, entry);
+                    job.status = DownloadStatus::Completed;
+                    job.progress = 100;
+                    job.file_path = Some(path.to_string_lossy().into_owned());
+                    job.finished_at = Some(now_secs());
+                    return Ok(job);
+                }
+            }
+            let job = new_job(
+                &self.inner,
+                &state.settings,
+                source,
+                CollectionEntry {
+                    video_id: video_id.clone(),
+                    title: title.clone(),
+                    artists: artists.clone(),
+                    thumbnail: thumbnail.clone(),
+                    collection: None,
+                    collection_kind: None,
+                },
+            );
             state.jobs.push(job.clone());
             if let Err(error) = self.inner.persist_locked(&state) {
                 state.jobs.pop();
@@ -289,6 +435,104 @@ impl Downloads {
         };
         self.inner.pump();
         Ok(job)
+    }
+
+    /// Queue every downloadable track of a collection (playlist/album) the caller enumerated
+    /// server-side. Smart dedup happens here, once, over a single folder snapshot: a track whose
+    /// audio already sits in the download folder — under this id, a collision suffix, or the same
+    /// normalized title under a different upload — is reported `alreadyDownloaded` with the path
+    /// it found, and a track already queued or downloading is folded into `queued`. The caller
+    /// gets back what actually entered the queue so a toast can say "12 added · 3 already on
+    /// disk · 5 unavailable" instead of a silent partial write.
+    pub fn enqueue_collection(
+        &self,
+        entries: Vec<CollectionEntry>,
+    ) -> Result<serde_json::Value, String> {
+        if entries.is_empty() {
+            return Err("This collection has no tracks to download.".into());
+        }
+        if entries.len() > MAX_ACTIVE_QUEUED {
+            return Err(format!(
+                "A collection can add at most {MAX_ACTIVE_QUEUED} tracks at once."
+            ));
+        }
+        let settings = self.inner.state.lock().settings.clone();
+        let index = FolderIndex::build(Path::new(&settings.path));
+        let mut added = 0usize;
+        let mut already = 0usize;
+        let mut skipped = 0usize;
+        let mut already_paths: Vec<String> = Vec::new();
+        {
+            let mut state = self.inner.state.lock();
+            ensure_running(&state)?;
+            // A batch either fits or reports the same full-queue condition a single enqueue
+            // would, rather than filling the queue halfway: room counts running workers and
+            // already-queued rows together.
+            let queued =
+                state.jobs.iter().filter(|job| job.status == DownloadStatus::Queued).count();
+            let room = MAX_ACTIVE_QUEUED.saturating_sub(state.running.len() + queued);
+            let mut batch_ids: HashSet<&str> = HashSet::new();
+            let mut created: Vec<String> = Vec::new();
+            for entry in &entries {
+                let Ok(source) = classify(&entry.video_id) else {
+                    skipped += 1;
+                    continue;
+                };
+                if entry.video_id.len() > 80
+                    || entry.title.len() > 512
+                    || entry.artists.len() > 512
+                    || entry.thumbnail.len() > 4096
+                    || entry.title.trim().is_empty()
+                {
+                    skipped += 1;
+                    continue;
+                }
+                // Dedupe against the queue: active or completed-with-file jobs already cover it,
+                // and the same id may appear twice inside one collection (a playlist with the
+                // song saved twice).
+                let in_queue = state.jobs.iter().any(|job| {
+                    job.video_id == entry.video_id
+                        && (job.status.is_active()
+                            || (job.status == DownloadStatus::Completed && file_present(job)))
+                });
+                if in_queue || !batch_ids.insert(entry.video_id.as_str()) {
+                    already += 1;
+                    continue;
+                }
+                if let Some(path) = index.find(&settings, entry) {
+                    already += 1;
+                    if already_paths.len() < 6 {
+                        already_paths.push(path.to_string_lossy().into_owned());
+                    }
+                    continue;
+                }
+                if added >= room {
+                    skipped += 1;
+                    continue;
+                }
+                let job = new_job(&self.inner, &settings, source, entry.clone());
+                created.push(job.id.clone());
+                state.jobs.push(job);
+                added += 1;
+            }
+            if added > 0 {
+                if let Err(error) = self.inner.persist_locked(&state) {
+                    // Drop exactly the rows this batch added on a failed write: a partial queue
+                    // the client believes is complete is worse than an error it can retry.
+                    state.jobs.retain(|job| !created.contains(&job.id));
+                    return Err(format!("Could not save the download queue: {error}"));
+                }
+            }
+        }
+        if added > 0 {
+            self.inner.pump();
+        }
+        Ok(json!({
+            "added": added,
+            "alreadyDownloaded": already,
+            "skipped": skipped,
+            "alreadyPaths": already_paths,
+        }))
     }
 
     pub fn cancel(&self, id: &str) -> Result<(), String> {
@@ -423,6 +667,39 @@ impl Downloads {
             }
             finished.await;
         }
+    }
+}
+
+/// One fresh, queued job for an entry, freezing the current settings and minting an id.
+fn new_job(
+    inner: &Inner,
+    settings: &DownloadSettings,
+    source: Source,
+    entry: CollectionEntry,
+) -> DownloadJob {
+    let collection =
+        entry.collection.as_deref().map(|label| truncate_chars(label.trim(), MAX_COMPONENT_BYTES));
+    DownloadJob {
+        id: inner.next_id(),
+        video_id: entry.video_id,
+        title: entry.title,
+        artists: entry.artists,
+        thumbnail: entry.thumbnail,
+        status: DownloadStatus::Queued,
+        progress: 0,
+        file_path: None,
+        error: None,
+        source: source.label().into(),
+        collection: collection.filter(|label| !label.is_empty()),
+        collection_kind: entry
+            .collection_kind
+            .as_deref()
+            .filter(|kind| matches!(*kind, "album" | "playlist"))
+            .map(str::to_owned),
+        created_at: now_secs(),
+        finished_at: None,
+        settings: settings.clone(),
+        warnings: Vec::new(),
     }
 }
 
@@ -790,6 +1067,9 @@ fn apply_result(job: &mut DownloadJob, result: Result<String, String>) {
         Err(error) => {
             job.status = DownloadStatus::Failed;
             job.error = Some(truncate_chars(&error, MAX_ERROR_LEN));
+            // A worker failure never passes through the RPC chokepoint (it is async), so log it
+            // here: the diagnostics CaptureLayer picks warn+ tracing up into the same record.
+            tracing::error!(job = %job.id, video_id = %job.video_id, error, "download failed");
         }
     }
 }
@@ -928,8 +1208,14 @@ fn publish(
         .extension()
         .and_then(|value| value.to_str())
         .ok_or("The download has no audio extension.")?;
-    let path =
-        compute_final_path(&job.settings, &job.title, &job.artists, &job.video_id, extension);
+    let path = compute_final_path(
+        &job.settings,
+        &job.title,
+        &job.artists,
+        &job.video_id,
+        extension,
+        job.collection.as_deref(),
+    );
     let parent = path.parent().ok_or("The download has no destination folder.")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let root = Path::new(&job.settings.path).canonicalize().map_err(|error| error.to_string())?;
@@ -1217,16 +1503,26 @@ fn error_message(tail: &str, code: Option<i32>) -> String {
     }
 }
 
+/// The destination for a finished download. A track batch-added from an album/playlist lands in
+/// a folder named after its collection (the collection *is* the grouping, so the artist
+/// subfolder is skipped for it); a single track follows the plain artist settings. Filenames
+/// are unchanged either way, which keeps `FolderIndex::find` (stem-keyed, walks recursively)
+/// able to dedup files wherever they sit.
 fn compute_final_path(
     settings: &DownloadSettings,
     title: &str,
     artists: &str,
     video_id: &str,
     ext: &str,
+    collection: Option<&str>,
 ) -> PathBuf {
     let mut dir = PathBuf::from(&settings.path);
-    if settings.organize_by_artist {
-        dir = dir.join(sanitize_component(primary_artist(artists)));
+    match collection.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(label) => dir = dir.join(sanitize_component(label)),
+        None if settings.organize_by_artist => {
+            dir = dir.join(sanitize_component(primary_artist(artists)));
+        }
+        None => {}
     }
     let base = if settings.organize_by_artist || artists.trim().is_empty() {
         title.to_string()
@@ -1369,10 +1665,15 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
+            // Tests share one process and run on parallel threads: pid+nanos alone can collide
+            // when two threads read the same coarse clock tick, failing create_dir on the
+            // loser's path. A process-local counter guarantees uniqueness.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "ryotunes-download-test-{}-{}",
+                "ryotunes-download-test-{}-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
             ));
             std::fs::create_dir(&path).unwrap();
             Self(path)
@@ -1420,11 +1721,184 @@ mod tests {
             file_path: None,
             error: None,
             source: "YouTube".into(),
+            collection: None,
+            collection_kind: None,
             created_at: 1,
             finished_at: None,
             settings: settings(directory, 1),
             warnings: Vec::new(),
         }
+    }
+
+    fn entry(video_id: &str, title: &str, artists: &str) -> CollectionEntry {
+        CollectionEntry {
+            video_id: video_id.into(),
+            title: title.into(),
+            artists: artists.into(),
+            thumbnail: String::new(),
+            collection: None,
+            collection_kind: None,
+        }
+    }
+
+    #[test]
+    fn folder_index_matches_exact_names_and_normalized_titles() {
+        let directory = Temp::new();
+        std::fs::write(directory.0.join("Artist - Song [AAAAAAAAAAA].opus"), b"x").unwrap();
+        std::fs::write(directory.0.join(format!("{STAGING_DIR}-whatever.opus")), b"partial")
+            .unwrap();
+        let settings = settings(&directory.0, 1);
+        let index = FolderIndex::build(&directory.0);
+
+        // Exact id match.
+        let exact = entry("AAAAAAAAAAA", "Song", "Artist");
+        assert!(index.find(&settings, &exact).is_some());
+        // A reupload of the same recording: different id, same normalized name — the "smart"
+        // half of the match.
+        let reupload = entry("BBBBBBBBBBB", "Song", "Artist");
+        assert!(index.find(&settings, &reupload).is_some());
+        // A different song, and the staging partial, never match.
+        assert!(index.find(&settings, &entry("BBBBBBBBBBB", "Other", "Artist")).is_none());
+        assert!(
+            index.find(&settings, &entry("whatever", "-whatever", "")).is_none(),
+            "the incomplete staging dir must not read as a saved file"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_enqueue_reports_a_file_already_on_disk() {
+        let directory = Temp::new();
+        let music = directory.0.join("music");
+        std::fs::create_dir(&music).unwrap();
+        let manager = manager(&directory.0);
+        manager.set_settings(settings(&music, 1)).unwrap();
+        std::fs::write(music.join("Daftpunk - Around the World [AAAAAAAAAAA].opus"), b"saved")
+            .unwrap();
+        // Same recording, different upload id: dedup must find it and NOT queue a job.
+        let job = manager
+            .enqueue(
+                "ZZZZZZZZZZZ".into(),
+                "Around the World".into(),
+                "Daftpunk".into(),
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(job.status, DownloadStatus::Completed);
+        assert!(job.file_path.unwrap().ends_with("[AAAAAAAAAAA].opus"));
+        assert!(manager.snapshot()["jobs"].as_array().unwrap().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collection_batch_dedupes_disk_queue_and_duplicates() {
+        let directory = Temp::new();
+        let music = directory.0.join("music");
+        std::fs::create_dir(&music).unwrap();
+        let manager = manager(&directory.0);
+        manager.set_settings(settings(&music, 1)).unwrap();
+        std::fs::write(music.join("One - Alpha [AAAAAAAAAAA].opus"), b"saved").unwrap();
+        // One already-queued (downloading) job counts as already covered, not added.
+        manager.enqueue("BBBBBBBBBBB".into(), "Beta".into(), "One".into(), String::new()).unwrap();
+        let res = manager
+            .enqueue_collection(vec![
+                entry("AAAAAAAAAAA", "Alpha", "One"),
+                entry("BBBBBBBBBBB", "Beta", "One"),
+                entry("CCCCCCCCCCC", "Gamma", "One"),
+                entry("CCCCCCCCCCC", "Gamma (reprise)", "One"),
+                entry("not-a-track-id!", "Local", "One"),
+            ])
+            .unwrap();
+        assert_eq!(res["added"], 1, "only the new, valid, non-duplicate track enters the queue");
+        assert_eq!(res["alreadyDownloaded"], 3, "disk hit, queue hit, in-batch repeat");
+        assert_eq!(res["skipped"], 1, "the unclassifiable id is skipped");
+        assert!(res["alreadyPaths"][0].as_str().unwrap().ends_with("[AAAAAAAAAAA].opus"));
+        let ids: Vec<String> = manager.snapshot()["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| job["videoId"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(ids.contains(&"CCCCCCCCCCC".to_string()));
+        assert!(!ids.contains(&"AAAAAAAAAAA".to_string()));
+    }
+
+    // The exact wire shape the QML client posts (camelCase keys). The batch endpoint once
+    // deserialized with snake_case field names, so every collection download died with
+    // "entries: missing field `video_id`" before any track was admitted.
+    #[test]
+    fn collection_entries_deserialize_from_the_camel_case_wire_shape() {
+        let wire = serde_json::json!([
+            {
+                "videoId": "AAAAAAAAAAA",
+                "title": "Alpha",
+                "artists": "One",
+                "thumbnail": "https://example/thumb.jpg",
+                "collection": "Greatest Hits",
+                "collectionKind": "album"
+            },
+            {
+                "videoId": "BBBBBBBBBBB",
+                "title": "Beta",
+                "artists": "One",
+                "thumbnail": ""
+            }
+        ]);
+        let entries: Vec<CollectionEntry> = serde_json::from_value(wire).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].video_id, "AAAAAAAAAAA");
+        assert_eq!(entries[0].collection.as_deref(), Some("Greatest Hits"));
+        assert_eq!(entries[0].collection_kind.as_deref(), Some("album"));
+        assert_eq!(entries[1].collection, None, "collection is optional on the wire");
+    }
+
+    #[tokio::test]
+    async fn batch_jobs_carry_their_collection_label_for_grouped_rendering() {
+        let directory = Temp::new();
+        let music = directory.0.join("music");
+        std::fs::create_dir(&music).unwrap();
+        let manager = manager(&directory.0);
+        manager.set_settings(settings(&music, 1)).unwrap();
+        let mut tagged = entry("AAAAAAAAAAA", "Alpha", "One");
+        tagged.collection = Some("  Late Night Playlist  ".into());
+        tagged.collection_kind = Some("playlist".into());
+        let mut untagged = entry("BBBBBBBBBBB", "Beta", "One");
+        untagged.collection = Some("   ".into());
+        untagged.collection_kind = Some("bogus-kind".into());
+        manager.enqueue_collection(vec![tagged, untagged]).unwrap();
+        let jobs = manager.snapshot()["jobs"].as_array().unwrap().clone();
+        let alpha = jobs.iter().find(|j| j["videoId"] == "AAAAAAAAAAA").unwrap();
+        assert_eq!(alpha["collection"], "Late Night Playlist", "label is trimmed");
+        assert_eq!(alpha["collectionKind"], "playlist");
+        let beta = jobs.iter().find(|j| j["videoId"] == "BBBBBBBBBBB").unwrap();
+        assert!(beta["collection"].is_null(), "a blank label stores no collection");
+        assert!(beta["collectionKind"].is_null(), "an unknown kind is dropped");
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn collection_tracks_land_in_a_folder_named_after_the_collection() {
+        let directory = Temp::new();
+        let mut s = settings(&directory.0, 1);
+        s.organize_by_artist = true;
+        let album =
+            compute_final_path(&s, "Alpha", "One", "AAAAAAAAAAA", "mp3", Some("Late Night"));
+        assert_eq!(
+            album,
+            directory.0.join("Late Night").join("Alpha [AAAAAAAAAAA].mp3"),
+            "a collection track is filed under its collection, not its artist"
+        );
+        let single = compute_final_path(&s, "Beta", "Two", "BBBBBBBBBBB", "mp3", None);
+        assert_eq!(
+            single,
+            directory.0.join("Two").join("Beta [BBBBBBBBBBB].mp3"),
+            "a single track still follows the artist folder"
+        );
+        let traversal =
+            compute_final_path(&s, "Gamma", "Three", "CCCCCCCCCCC", "mp3", Some("../../etc"));
+        assert!(
+            traversal.starts_with(&directory.0),
+            "the collection folder is sanitized inside the root"
+        );
     }
 
     #[test]
@@ -1435,7 +1909,14 @@ mod tests {
         assert!(publish(&staging, &job(&directory.0), &[], &mut Vec::new()).is_err());
         std::fs::write(staging.join("audio.mp3"), b"finished audio").unwrap();
         let j = job(&directory.0);
-        let first = compute_final_path(&j.settings, &j.title, &j.artists, &j.video_id, "mp3");
+        let first = compute_final_path(
+            &j.settings,
+            &j.title,
+            &j.artists,
+            &j.video_id,
+            "mp3",
+            j.collection.as_deref(),
+        );
         std::fs::write(&first, b"existing user music").unwrap();
         let second = publish(&staging, &job(&directory.0), &[], &mut Vec::new()).unwrap();
         assert_eq!(std::fs::read(&first).unwrap(), b"existing user music");
@@ -1558,7 +2039,8 @@ mod tests {
         // Pre-place a cover at the base stem so a suffix-0 companion collision forces the whole set
         // (audio + sidecars) to the next suffix, and prove the existing cover is never overwritten.
         let j = job(&directory.0);
-        let base_audio = compute_final_path(&j.settings, &j.title, &j.artists, &j.video_id, "mp3");
+        let base_audio =
+            compute_final_path(&j.settings, &j.title, &j.artists, &j.video_id, "mp3", None);
         let base_cover = base_audio.with_extension("jpg");
         std::fs::write(&base_cover, b"existing cover").unwrap();
 
